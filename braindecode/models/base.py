@@ -1,10 +1,13 @@
 # Authors: Pierre Guetschel
+#          Maciej Sliwowski
 #
 # License: BSD-3
 
 import warnings
-from typing import Iterable, List, Optional, Dict
+from typing import Dict, Iterable, List, Optional, Tuple
 
+import numpy as np
+import torch
 from docstring_inheritance import NumpyDocstringInheritanceInitMeta
 from torchinfo import ModelStatistics, summary
 
@@ -46,11 +49,20 @@ class EEGModuleMixin(metaclass=NumpyDocstringInheritanceInitMeta):
         Length of the input window in seconds.
     sfreq : float
         Sampling frequency of the EEG recordings.
+    add_log_softmax: bool
+        Whether to use log-softmax non-linearity as the output function.
+        LogSoftmax final layer will be removed in the future.
+        Please adjust your loss function accordingly (e.g. CrossEntropyLoss)!
+        Check the documentation of the torch.nn loss functions:
+        https://pytorch.org/docs/stable/nn.html#loss-functions.
 
     Raises
     ------
     ValueError: If some input signal-related parameters are not specified
                 and can not be inferred.
+
+    FutureWarning: If add_log_softmax is True, since LogSoftmax final layer
+                   will be removed in the future.
 
     Notes
     -----
@@ -66,6 +78,7 @@ class EEGModuleMixin(metaclass=NumpyDocstringInheritanceInitMeta):
             n_times: Optional[int] = None,
             input_window_seconds: Optional[float] = None,
             sfreq: Optional[float] = None,
+            add_log_softmax: Optional[bool] = False,
     ):
         if (
                 n_chans is not None and
@@ -89,6 +102,7 @@ class EEGModuleMixin(metaclass=NumpyDocstringInheritanceInitMeta):
         self._n_times = n_times
         self._input_window_seconds = input_window_seconds
         self._sfreq = sfreq
+        self._add_log_softmax = add_log_softmax
         super().__init__()
 
     @property
@@ -157,6 +171,92 @@ class EEGModuleMixin(metaclass=NumpyDocstringInheritanceInitMeta):
                 'Either specify sfreq or input_window_seconds and n_times.'
             )
         return self._sfreq
+
+    @property
+    def add_log_softmax(self):
+        if self._add_log_softmax:
+            warnings.warn("LogSoftmax final layer will be removed! " +
+                          "Please adjust your loss function accordingly (e.g. CrossEntropyLoss)!")
+        return self._add_log_softmax
+
+    @property
+    def input_shape(self) -> Tuple[int]:
+        """Input data shape."""
+        return (1, self.n_chans, self.n_times)
+
+    def get_output_shape(self) -> Tuple[int]:
+        """Returns shape of neural network output for batch size equal 1.
+
+        Returns
+        -------
+        output_shape: Tuple[int]
+            shape of the network output for `batch_size==1` (1, ...)
+    """
+        with torch.inference_mode():
+            try:
+                return tuple(self.forward(
+                    torch.zeros(
+                        self.input_shape,
+                        dtype=next(self.parameters()).dtype,
+                        device=next(self.parameters()).device
+                    )).shape)
+            except RuntimeError as exc:
+                if str(exc).endswith(
+                    ("Output size is too small",
+                     "Kernel size can't be greater than actual input size")
+                ):
+                    msg = (
+                        "During model prediction RuntimeError was thrown showing that at some "
+                        f"layer `{str(exc).split('.')[-1]}` (see above in the stacktrace). This "
+                        "could be caused by providing too small `n_times`/`input_window_seconds`. "
+                        "Model may require longer chunks of signal in the input than "
+                        f"{self.input_shape}."
+                    )
+                    raise ValueError(msg) from exc
+                raise exc
+
+    def to_dense_prediction_model(self, axis: Tuple[int] = (2, 3)) -> None:
+        """
+        Transform a sequential model with strides to a model that outputs
+        dense predictions by removing the strides and instead inserting dilations.
+        Modifies model in-place.
+
+        Parameters
+        ----------
+        axis: int or (int,int)
+            Axis to transform (in terms of intermediate output axes)
+            can either be 2, 3, or (2,3).
+
+        Notes
+        -----
+        Does not yet work correctly for average pooling.
+        Prior to version 0.1.7, there had been a bug that could move strides
+        backwards one layer.
+
+        """
+        if not hasattr(axis, "__len__"):
+            axis = [axis]
+        assert all([ax in [2, 3] for ax in axis]), "Only 2 and 3 allowed for axis"
+        axis = np.array(axis) - 2
+        stride_so_far = np.array([1, 1])
+        for module in self.modules():
+            if hasattr(module, "dilation"):
+                assert module.dilation == 1 or (module.dilation == (1, 1)), (
+                    "Dilation should equal 1 before conversion, maybe the model is "
+                    "already converted?"
+                )
+                new_dilation = [1, 1]
+                for ax in axis:
+                    new_dilation[ax] = int(stride_so_far[ax])
+                module.dilation = tuple(new_dilation)
+            if hasattr(module, "stride"):
+                if not hasattr(module.stride, "__len__"):
+                    module.stride = (module.stride, module.stride)
+                stride_so_far *= np.array(module.stride)
+                new_stride = list(module.stride)
+                for ax in axis:
+                    new_stride[ax] = 1
+                module.stride = tuple(new_stride)
 
     def get_torchinfo_statistics(
             self,
